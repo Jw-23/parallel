@@ -108,6 +108,7 @@ struct Workload {
     std::array<int, 2> batch_sizes;
     unsigned rounds;
     unsigned heavy_rounds;
+    bool heavy_tail = false;
 };
 
 std::uint64_t compute(std::size_t index, unsigned rounds) noexcept {
@@ -133,11 +134,13 @@ bool succeeded(benchmark::State& state, const parallel::Result<T>& result) {
 void compare_schedulers(benchmark::State& state, Scheduler scheduler, Workload workload) {
     const auto size = static_cast<std::size_t>(state.range(0));
     const auto workers = static_cast<std::size_t>(state.range(1));
-    // Match the executor's grain so all schedulers distribute the same chunks.
+    // The mutex pool is a fixed-size chunking baseline.
     const auto grain = std::max(std::size_t{1}, std::min(std::size_t{64}, size / workers / 8));
-    const auto heavy_end = workload.heavy_rounds == 0 ? 0 : size / 16;
+    const auto heavy_begin = workload.heavy_tail ? size - std::min(std::size_t{64}, size) : 0;
+    const auto heavy_end = workload.heavy_tail ? size : (workload.heavy_rounds == 0 ? 0 : size / 16);
     const auto calculate = [&](std::size_t index) {
-        return compute(index, index < heavy_end ? workload.heavy_rounds : workload.rounds);
+        const bool heavy = index >= heavy_begin && index < heavy_end;
+        return compute(index, heavy ? workload.heavy_rounds : workload.rounds);
     };
     // Build the lazy plan before timing its collection.
     using Index = parallel::Range::value_type;
@@ -231,6 +234,7 @@ const bool cases_registered = [] {
         {"Uneven", {4096, 65536}, 8, 256},
         {"ShortTasks", {128, 4096}, 4, 0},
         {"LongTasks", {8, 32}, 1u << 20, 0},
+        {"TailHeavy", {4096, 65536}, 4, 1u << 14, true},
     };
     for (const auto& scheduler : schedulers) {
         for (const auto& workload : workloads) {

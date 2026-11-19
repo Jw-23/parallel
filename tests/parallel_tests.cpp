@@ -397,6 +397,32 @@ TEST(SchedulerTest, CanGrowAndRunSmallerBatchesAfterAWorkerError) {
     }
 }
 
+TEST(SchedulerTest, AllowsTheWholeTeamToWorkOnTheTail) {
+    constexpr std::size_t tail_begin = 4096 - 64;
+    constexpr std::size_t size = 4100;
+    constexpr std::size_t workers = 4;
+    parallel::detail::Executor executor(workers);
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::size_t arrived = 0;
+
+    const auto result = executor.run_chunks(size, [&](std::size_t first, std::size_t last) -> Result<void> {
+        if (last > tail_begin) {
+            EXPECT_GE(first, tail_begin);
+            std::unique_lock<std::mutex> lock(mutex);
+            if (++arrived >= workers) {
+                ready.notify_all();
+            } else {
+                EXPECT_TRUE(ready.wait_for(lock, std::chrono::seconds(5), [&] { return arrived >= workers; }));
+            }
+        }
+        return outcome::success();
+    });
+
+    ASSERT_TRUE(result) << result.error().message();
+    EXPECT_GE(arrived, workers);
+}
+
 TEST(SchedulerTest, OtherWorkersContinueWhileOneChunkIsBlocked) {
     std::mutex mutex;
     std::condition_variable ready;

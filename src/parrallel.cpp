@@ -39,7 +39,7 @@ class Batch {
 public:
     Batch(std::size_t size, std::size_t workers, const Executor::ChunkTask& run)
         : size_(size), grain_(std::max(std::size_t{1}, std::min(std::size_t{64}, size / workers / 8))),
-          run_(run) {}
+          tail_begin_(grain_ >= 16 ? size - grain_ - size % grain_ : size), run_(run) {}
 
     bool has_work() const noexcept {
         return !cancelled_.load(std::memory_order_relaxed) && next_.load(std::memory_order_relaxed) < size_;
@@ -49,21 +49,12 @@ public:
 
     void work() noexcept {
         const auto status = run_safe([&]() -> Result<void> {
-            while (!cancelled_.load(std::memory_order_relaxed)) {
-                auto first = next_.load(std::memory_order_relaxed);
-                if (first == size_) {
-                    break;
-                }
-                const auto last = first + std::min(grain_, size_ - first);
-                if (next_.compare_exchange_weak(first, last, std::memory_order_relaxed) &&
-                    !cancelled_.load(std::memory_order_relaxed)) {
-                    const auto chunk = run_(first, last);
-                    if (!chunk) {
-                        return chunk.as_failure();
-                    }
-                }
+            const auto prefix = consume(tail_begin_, grain_);
+            if (!prefix || tail_begin_ == size_) {
+                return prefix;
             }
-            return outcome::success();
+            // Workers can share the final full chunk and any remainder.
+            return consume(size_, grain_ / 4);
         });
         if (!status && !cancelled_.exchange(true, std::memory_order_relaxed)) {
             error_ = status.assume_error();
@@ -79,8 +70,27 @@ public:
     }
 
 private:
+    Result<void> consume(std::size_t end, std::size_t grain) {
+        while (!cancelled_.load(std::memory_order_relaxed)) {
+            auto first = next_.load(std::memory_order_relaxed);
+            if (first >= end) {
+                break;
+            }
+            const auto last = first + std::min(grain, end - first);
+            if (next_.compare_exchange_weak(first, last, std::memory_order_relaxed) &&
+                !cancelled_.load(std::memory_order_relaxed)) {
+                const auto chunk = run_(first, last);
+                if (!chunk) {
+                    return chunk.as_failure();
+                }
+            }
+        }
+        return outcome::success();
+    }
+
     const std::size_t size_;
     const std::size_t grain_;
+    const std::size_t tail_begin_;
     const Executor::ChunkTask& run_;
     std::atomic<std::size_t> next_{0};
     std::atomic<bool> cancelled_{false};
@@ -114,7 +124,7 @@ struct Executor::Team {
             batch = &task;
             worker_budget = background_workers;
         }
-        if (task.has_single_item_chunks()) {
+        if (background_workers > 1 && task.has_single_item_chunks()) {
             ready.notify_all();
         } else {
             ready.notify_one();
@@ -144,7 +154,7 @@ private:
             ++active;
             const bool wake_next = active < worker_budget && !task->has_single_item_chunks();
             lock.unlock();
-            if (wake_next) {
+            if (wake_next && task->has_work()) {
                 ready.notify_one();
             }
             task->work();
