@@ -135,6 +135,37 @@ TEST(PipelineTest, CollectsMoveOnlyOutput) {
     EXPECT_EQ(*result.value(), 3);
 }
 
+TEST(PipelineTest, ComposesFourPureMapsAcrossDifferentTypes) {
+    std::vector<int> input{1, 2, 3, 4};
+    const auto plan = into_inter(input).iter_paral(3)
+        .map_pure([](const int& value) { return value * 2; })
+        .map_pure([](const int& value) { return std::make_unique<int>(value); })
+        .map_pure([](const std::unique_ptr<int>& value) { return std::to_string(*value); })
+        .map_pure([](const std::string& value) { return "value=" + value; });
+    input[1] = 8;
+    const std::vector<std::string> expected{"value=2", "value=16", "value=6", "value=8"};
+    expect_value(plan.collect(), expected);
+    EXPECT_EQ(std::vector<std::string>(plan.begin(), plan.end()), expected);
+    EXPECT_EQ(input, (std::vector<int>{1, 8, 3, 4}));
+
+    const auto twice = [](std::int64_t value) { return value * 2; };
+    expect_value(Range(4, 0, -1).into_inter().iter_paral(3).map_pure(twice).map_pure(twice).collect(),
+                 (std::vector<std::int64_t>{16, 12, 8, 4}));
+    expect_value(Range(0).into_inter().map_pure(twice).collect(), std::vector<std::int64_t>{});
+    expect_error(Range(0, 1, 0).into_inter().map_pure(twice).map_pure(twice).collect(),
+                 std::errc::invalid_argument);
+}
+
+TEST(PipelineTest, BorrowsMaterializedMoveOnlyValuesDuringFusedCollection) {
+    const auto plan = Range(128).into_inter().iter_paral(4)
+        .map([](auto value) { return std::make_unique<Range::value_type>(value); })
+        .map_pure([](const auto& value) { return *value; })
+        .map_pure([](auto value) { return value * 3; });
+
+    const Range expected(0, 384, 3);
+    expect_value(plan.collect(), (std::vector<Range::value_type>(expected.begin(), expected.end())));
+}
+
 TEST(PipelineTest, ExposesWritableReferencesAndUpdatesArrays) {
     std::list<int> values{1, 2, 3, 4};
     for (auto& value : iter(values)) {
@@ -236,10 +267,37 @@ TEST(ReduceTest, AppliesSeedOnceAndKeepsOperandOrder) {
     const std::vector<std::string> words{"a", "b", "c", "d", "e", "f", "g"};
     expect_value(into_inter(words).iter_paral(3).reduce(std::string("!"), std::plus<>{}).collect_one(),
                  std::string("!abcdefg"));
-    expect_value(into_inter(words).iter_paral(3).reduce(std::size_t{0}, [](auto n, const auto& word) {
-        return n + word.size();
-    }).collect_one(), std::size_t{7});
-    expect_value(Range(1, 5).into_inter().reduce(std::int64_t{0}, std::minus<>{}).collect_one(), -10);
+    expect_value(into_inter(words).iter_paral(3)
+                     .map_pure([](const auto& word) { return word.size(); })
+                     .reduce(std::size_t{0}, std::plus<>{}).collect_one(),
+                 std::size_t{7});
+}
+
+TEST(ReduceTest, ReducesPureMapOnMultipleWorkers) {
+    using Value = Range::value_type;
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::thread::id first_worker;
+    bool used_second_worker = false;
+    const auto sum = Range(128).into_inter().iter_paral(2)
+        .map_pure([](Value value) { return value + 10; })
+        .map_pure([](Value value) { return value + 20; })
+        .map_pure([](Value value) { return value + 30; })
+        .map_pure([](Value value) { return value + 40; })
+        .reduce(Value{7}, [&](Value a, Value b) {
+            const auto worker = std::this_thread::get_id();
+            std::unique_lock<std::mutex> lock(mutex);
+            if (first_worker == std::thread::id{}) {
+                first_worker = worker;
+                EXPECT_TRUE(ready.wait_for(lock, std::chrono::seconds(5), [&] { return used_second_worker; }));
+            } else if (!used_second_worker && worker != first_worker) {
+                used_second_worker = true;
+                ready.notify_one();
+            }
+            return a + b;
+        });
+    expect_value(sum.collect_one(), 20935);
+    EXPECT_TRUE(used_second_worker);
 }
 
 TEST(PipelineErrorsTest, PropagatesCallbackErrorsAndSkipsDownstreamStages) {
@@ -260,6 +318,10 @@ TEST(PipelineErrorsTest, PropagatesCallbackErrorsAndSkipsDownstreamStages) {
             return value;
         }).collect();
         expect_error(downstream, std::errc::permission_denied);
+        expect_error(plan.map_pure([](Value value) { return value + 1; })
+                         .map_pure([](Value value) { return value * 2; })
+                         .reduce(Value{0}, std::plus<>{}).collect_one(),
+                     std::errc::permission_denied);
         const auto first = plan.begin();
         EXPECT_EQ(first, plan.end());
         EXPECT_EQ(first.error(), std::errc::permission_denied);

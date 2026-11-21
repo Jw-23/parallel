@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -217,6 +218,92 @@ void compare_schedulers(benchmark::State& state, Scheduler scheduler, Workload w
     }
     state.SetItemsProcessed(state.iterations() * state.range(0));
 }
+
+using Index = parallel::Range::value_type;
+
+const auto increment = [](Index value) { return value + 13; };
+const auto scale = [](Index value) { return value * 3; };
+const auto scramble = [](Index value) { return value ^ 85; };
+const auto halve = [](Index value) { return value / 2; };
+
+template<class Source>
+auto map_chain(const Source& source, std::false_type) {
+    return source.map(increment).map(scale).map(scramble).map(halve);
+}
+
+template<class Source>
+auto map_chain(const Source& source, std::true_type) {
+    return source.map_pure(increment).map_pure(scale).map_pure(scramble).map_pure(halve);
+}
+
+template<bool Fused>
+void collect_maps(benchmark::State& state) {
+    const auto size = static_cast<Index>(state.range(0));
+    const auto source = parallel::Range(size).into_inter().iter_paral(static_cast<std::size_t>(state.range(1)));
+    const auto plan = map_chain(source, std::integral_constant<bool, Fused>{});
+    for (auto iteration : state) {
+        static_cast<void>(iteration);
+        auto result = plan.collect();
+        if (!succeeded(state, result)) {
+            return;
+        }
+        benchmark::DoNotOptimize(result.assume_value().data());
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * state.range(0));
+}
+
+void collect_maps_loop(benchmark::State& state) {
+    const auto size = static_cast<std::size_t>(state.range(0));
+    Executor executor(static_cast<std::size_t>(state.range(1)));
+    for (auto iteration : state) {
+        static_cast<void>(iteration);
+        std::vector<Index> output(size);
+        const auto result = executor.run_chunks(size, [&](std::size_t first, std::size_t last) -> parallel::Result<void> {
+            for (auto i = first; i < last; ++i) {
+                output[i] = halve(scramble(scale(increment(static_cast<Index>(i)))));
+            }
+            return outcome::success();
+        });
+        if (!succeeded(state, result)) {
+            return;
+        }
+        benchmark::DoNotOptimize(output.data());
+        benchmark::ClobberMemory();
+    }
+    state.SetItemsProcessed(state.iterations() * state.range(0));
+}
+
+template<bool Fused>
+void reduce_maps(benchmark::State& state) {
+    const auto size = static_cast<Index>(state.range(0));
+    const auto source = parallel::Range(size).into_inter().iter_paral(static_cast<std::size_t>(state.range(1)));
+    const auto plan = map_chain(source, std::integral_constant<bool, Fused>{}).reduce(Index{0}, std::plus<>{});
+    for (auto iteration : state) {
+        static_cast<void>(iteration);
+        auto result = plan.collect_one();
+        if (!succeeded(state, result)) {
+            return;
+        }
+        benchmark::DoNotOptimize(result.assume_value());
+    }
+    state.SetItemsProcessed(state.iterations() * state.range(0));
+}
+
+void fusion_sizes(benchmark::internal::Benchmark* test) {
+    test->ArgNames({"elements", "workers"})->UseRealTime()->Unit(benchmark::kMicrosecond);
+    for (int size : {4096, 1048576}) {
+        for (int workers : {1, 4}) {
+            test->Args({size, workers});
+        }
+    }
+}
+
+BENCHMARK_TEMPLATE(collect_maps, false)->Apply(fusion_sizes);
+BENCHMARK_TEMPLATE(collect_maps, true)->Apply(fusion_sizes);
+BENCHMARK(collect_maps_loop)->Apply(fusion_sizes);
+BENCHMARK_TEMPLATE(reduce_maps, false)->Apply(fusion_sizes);
+BENCHMARK_TEMPLATE(reduce_maps, true)->Apply(fusion_sizes);
 
 const bool cases_registered = [] {
     const struct {

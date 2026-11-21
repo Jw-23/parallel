@@ -544,6 +544,101 @@ struct MakePair {
     auto operator()(const A& a, const B& b) const { return std::pair<A, B>(a, b); }
 };
 
+template<class Evaluate>
+using PlanStorage = typename Invocation<const Evaluate&, Executor&>::value_type;
+
+template<class Parent, class Function>
+class MapPlan;
+
+template<class Evaluate>
+auto prepare_values(const Evaluate& evaluate, Executor& executor) {
+    return evaluate(executor);
+}
+
+template<class Parent, class Function>
+auto prepare_values(const MapPlan<Parent, Function>& evaluate, Executor& executor) {
+    return evaluate.prepare(executor);
+}
+
+template<class Input>
+auto chunk_reader(const Input& input, int) -> decltype(input.for_chunk()) {
+    return input.for_chunk();
+}
+
+inline RangeValues chunk_reader(const RangeValues& input, int) noexcept {
+    return input;
+}
+
+template<class Input>
+const Input& chunk_reader(const Input& input, long) noexcept {
+    return input;
+}
+
+template<class Parent, class Function>
+class MapPlan {
+    using InputValue = typename PlanStorage<Parent>::value_type;
+    using Value = std::decay_t<Invocation<const Function&, const InputValue&>>;
+
+    template<class Input>
+    struct Reader {
+        using value_type = Value;
+
+        std::size_t size() const noexcept { return input.size(); }
+
+        Value read(std::size_t index) const {
+            const InputValue& value = input.read(index);
+            return detail::invoke(transform, value);
+        }
+
+        auto for_chunk() const {
+            using ChunkInput = decltype(detail::chunk_reader(input, 0));
+            return Reader<ChunkInput>{detail::chunk_reader(input, 0), transform};
+        }
+
+        Input input;
+        const Function& transform;
+    };
+
+public:
+    MapPlan(std::shared_ptr<const Parent> parent, Function transform)
+        : parent_(std::move(parent)), transform_(std::move(transform)) {}
+
+    // Prepared readers borrow the callbacks from the plan for this evaluation.
+    auto prepare(Executor& executor) const {
+        auto input = prepare_values(*parent_, executor);
+        using Prepared = Reader<typename decltype(input)::value_type>;
+        if (!input) {
+            return Result<Prepared>(input.as_failure());
+        }
+        return Result<Prepared>(outcome::success(Prepared{std::move(input).assume_value(), transform_}));
+    }
+
+    Result<Values<Value>> operator()(Executor& executor) const {
+        auto prepared = prepare(executor);
+        if (!prepared) {
+            return prepared.as_failure();
+        }
+        const auto& input = prepared.assume_value();
+        Values<Value> output(input.size());
+        const auto mapped = executor.run_chunks(input.size(), [&](std::size_t first, std::size_t last) -> Result<void> {
+            // Snapshot Range's metadata in the loop's local reader. Materialized input stays borrowed.
+            const auto reader = input.for_chunk();
+            for (auto i = first; i < last; ++i) {
+                output.put(i, reader.read(i));
+            }
+            return outcome::success();
+        });
+        if (!mapped) {
+            return mapped.as_failure();
+        }
+        return outcome::success(std::move(output));
+    }
+
+private:
+    std::shared_ptr<const Parent> parent_;
+    Function transform_;
+};
+
 template<class S, class A, class F>
 Result<A> fold(const S& input, A total, const F& combine, std::size_t first, std::size_t last) {
     for (auto i = first; i < last; ++i) {
@@ -558,12 +653,7 @@ Result<A> fold(const S& input, A total, const F& combine, std::size_t first, std
 }
 
 template<class S, class A, class F>
-Result<A> reduce(const S& input, const A& initial, const F& combine, Executor&, std::false_type) {
-    return fold(input, initial, combine, 0, input.size());
-}
-
-template<class S, class A, class F>
-Result<A> reduce(const S& input, const A& initial, const F& combine, Executor& executor, std::true_type) {
+Result<A> reduce(const S& input, const A& initial, const F& combine, Executor& executor) {
     const auto count = input.size();
     const auto workers = executor.worker_limit();
     if (workers <= 1 || count <= 1) {
@@ -607,7 +697,7 @@ Result<A> reduce(const S& input, const A& initial, const F& combine, Executor& e
 // Callbacks can return plain values (or void) or an Outcome result with an error code.
 template<class Evaluate, bool InPlace>
 class Pipeline {
-    using Storage = typename detail::Invocation<const Evaluate&, detail::Executor&>::value_type;
+    using Storage = detail::PlanStorage<Evaluate>;
 
 public:
     using value_type = typename Storage::value_type;
@@ -645,6 +735,16 @@ public:
             }
             return detail::outcome::success(std::move(output));
         });
+    }
+
+    // A pure transform may run together with another stage on each element. It
+    // must produce a value without side effects or errors, using only its input
+    // and immutable state. Use map for callbacks with observable stage order.
+    template<class Function, bool Mutable = InPlace,
+             class Value = std::decay_t<detail::Invocation<const Function&, const value_type&>>,
+             std::enable_if_t<!Mutable && !std::is_void<Value>::value && !detail::ResultTraits<Value>::value, int> = 0>
+    auto map_pure(Function transform) const {
+        return next(detail::MapPlan<Evaluate, Function>(evaluate_, std::move(transform)));
     }
 
     template<class Function>
@@ -722,20 +822,20 @@ public:
         });
     }
 
-    // Parallel grouping requires an associative reducer. The seed is applied once.
-    // Different input and accumulator types use a sequential left fold.
-    template<class Accumulator, class Function>
+    // The reducer must be associative. Parallel grouping preserves operand order
+    // and applies the seed once. Use map or map_pure to change the element type.
+    template<class Accumulator, class Function,
+             std::enable_if_t<std::is_same<Accumulator, value_type>::value, int> = 0>
     auto reduce(Accumulator initial, Function combine) const {
         using Output = detail::Values<Accumulator>;
         return next<false>([parent = evaluate_, initial = std::move(initial), combine = std::move(combine)]
                            (detail::Executor& executor) -> Result<Output> {
-            auto input_result = (*parent)(executor);
+            auto input_result = detail::prepare_values(*parent, executor);
             if (!input_result) {
                 return input_result.as_failure();
             }
             auto& input = input_result.assume_value();
-            using SameValue = std::is_same<value_type, Accumulator>;
-            auto total_result = detail::reduce(input, initial, combine, executor, SameValue{});
+            auto total_result = detail::reduce(input, initial, combine, executor);
             if (!total_result) {
                 return total_result.as_failure();
             }
