@@ -221,7 +221,7 @@ public:
     ~Executor();
 
     std::size_t worker_limit() const noexcept { return worker_limit_; }
-    Result<void> run_chunks(std::size_t size, const ChunkTask& run);
+    Result<void> run_chunks(std::size_t size, const ChunkTask& run, std::size_t grain_hint = 0);
 
 private:
     struct Team;
@@ -700,11 +700,12 @@ using Executor = detail::Executor;
 // team is reused between calls from the same thread. A callback may return
 // void or Result<void>.
 template<class Function>
-Result<void> for_each_chunk(std::size_t size, std::size_t workers, const Function& apply) {
+Result<void> for_each_chunk(std::size_t size, std::size_t workers, const Function& apply,
+                            std::size_t grain_hint = 0) {
     detail::Executor executor(workers, detail::Executor::Reuse::calling_thread);
     return executor.run_chunks(size, [&](std::size_t first, std::size_t last) {
         return detail::call(apply, first, last);
-    });
+    }, grain_hint);
 }
 >>>>>>> 1896db9 (Add chunk-level parallel loop API)
 

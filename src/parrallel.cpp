@@ -37,8 +37,10 @@ thread_local bool may_cache_team = true;
 
 class Batch {
 public:
-    Batch(std::size_t size, std::size_t workers, const Executor::ChunkTask& run)
-        : size_(size), grain_(std::max(std::size_t{1}, std::min(std::size_t{64}, size / workers / 8))),
+    Batch(std::size_t size, std::size_t workers, const Executor::ChunkTask& run, std::size_t grain_hint)
+        : size_(size),
+          grain_(grain_hint != 0 ? std::max(std::size_t{1}, std::min(grain_hint, size))
+                                 : std::max(std::size_t{1}, std::min(std::size_t{64}, size / workers / 8))),
           tail_begin_(grain_ >= 16 ? size - grain_ - size % grain_ : size), run_(run) {}
 
     bool has_work() const noexcept {
@@ -213,7 +215,7 @@ void Executor::acquire_team() {
     }
 }
 
-Result<void> Executor::run_chunks(std::size_t size, const ChunkTask& run) {
+Result<void> Executor::run_chunks(std::size_t size, const ChunkTask& run, std::size_t grain_hint) {
     if (size == 0) {
         return outcome::success();
     }
@@ -225,7 +227,7 @@ Result<void> Executor::run_chunks(std::size_t size, const ChunkTask& run) {
         if (!team_) {
             acquire_team();
         }
-        Batch batch(size, workers, run);
+        Batch batch(size, workers, run, grain_hint);
         return team_->run(batch, workers - 1);
     });
 }

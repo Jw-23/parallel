@@ -554,3 +554,13 @@ TEST(ChunkTest, RunsChunkBodiesAndPropagatesErrors) {
     EXPECT_FALSE(failed);
     EXPECT_EQ(failed.error(), std::errc::invalid_argument);
 }
+
+TEST(ChunkTest, HonorsGrainHint) {
+    std::atomic<std::size_t> largest{0};
+    const auto ok = parallel::for_each_chunk(1000, 4, [&](std::size_t first, std::size_t last) {
+        largest.store(std::max(largest.load(), last - first), std::memory_order_relaxed);
+    }, 100);
+    EXPECT_TRUE(ok) << ok.error().message();
+    EXPECT_LE(largest.load(), 100u);
+    EXPECT_GT(largest.load(), 0u);
+}
