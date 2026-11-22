@@ -169,7 +169,7 @@ template<class T, class E, class Policy>
 struct ResultTraits<outcome::basic_result<T, E, Policy>> : std::true_type { using value_type = T; };
 
 template<class Function, class... Args>
-using Invocation = std::result_of_t<Function(Args...)>;
+using Invocation = boost::compat::invoke_result_t<Function, Args...>;
 
 template<class Function, class... Args>
 using CallbackValue = typename ResultTraits<std::decay_t<Invocation<Function, Args...>>>::value_type;
@@ -690,7 +690,23 @@ Result<A> reduce(const S& input, const A& initial, const F& combine, Executor& e
 
 }  // namespace detail
 
+<<<<<<< HEAD
 using Executor = detail::Executor;
+=======
+// Run `apply(first, last)` over arbitrary half-open chunks of [0, size). This
+// is the chunk-level primitive behind the collection pipeline; it is useful
+// when the body is a cache-friendly loop over several arrays rather than a
+// per-element transform. The calling thread participates, and a single idle
+// team is reused between calls from the same thread. A callback may return
+// void or Result<void>.
+template<class Function>
+Result<void> for_each_chunk(std::size_t size, std::size_t workers, const Function& apply) {
+    detail::Executor executor(workers, detail::Executor::Reuse::calling_thread);
+    return executor.run_chunks(size, [&](std::size_t first, std::size_t last) {
+        return detail::call(apply, first, last);
+    });
+}
+>>>>>>> 1896db9 (Add chunk-level parallel loop API)
 
 // Operations build reusable plans. Each collection evaluates the plan again.
 // A calling thread can retain one idle team between collections.

@@ -535,3 +535,22 @@ TEST(SchedulerTest, OtherWorkersContinueWhileOneChunkIsBlocked) {
 }
 
 }  // namespace
+
+TEST(ChunkTest, RunsChunkBodiesAndPropagatesErrors) {
+    std::atomic<std::size_t> visited{0};
+    const auto ok = parallel::for_each_chunk(1000, 4, [&](std::size_t first, std::size_t last) {
+        visited.fetch_add(last - first, std::memory_order_relaxed);
+    });
+    EXPECT_TRUE(ok) << ok.error().message();
+    EXPECT_EQ(visited.load(), 1000u);
+
+    const auto empty = parallel::for_each_chunk(0, 4, [](std::size_t, std::size_t) {});
+    EXPECT_TRUE(empty) << empty.error().message();
+
+    const auto failed = parallel::for_each_chunk(
+        100, 2, [](std::size_t, std::size_t) -> Result<void> {
+            return outcome::failure(std::make_error_code(std::errc::invalid_argument));
+        });
+    EXPECT_FALSE(failed);
+    EXPECT_EQ(failed.error(), std::errc::invalid_argument);
+}
