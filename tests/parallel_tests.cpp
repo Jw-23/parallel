@@ -125,6 +125,29 @@ TEST(PipelineTest, EvaluatesOnTraversalOrCollection) {
                  std::vector<std::pair<int, std::int64_t>>{{3, 0}, {18, 1}});
 }
 
+TEST(PipelineTest, ArithmeticMapChainCompletesEachStageBeforeTheNext) {
+    using Value = Range::value_type;
+    constexpr Value size = 1000;
+    std::array<std::atomic<Value>, 4> finished;
+    for (auto& count : finished) {
+        count.store(0, std::memory_order_relaxed);
+    }
+    const auto stage = [&](std::size_t index) {
+        return [&, index](Value value) {
+            if (index != 0) {
+                EXPECT_EQ(finished[index - 1].load(std::memory_order_relaxed), size);
+            }
+            finished[index].fetch_add(1, std::memory_order_relaxed);
+            return value + 1;
+        };
+    };
+
+    const auto result = Range(size).into_inter().iter_paral(4)
+        .map(stage(0)).map(stage(1)).map(stage(2)).map(stage(3)).collect();
+    const Range expected(4, size + 4);
+    expect_value(result, std::vector<Value>(expected.begin(), expected.end()));
+}
+
 TEST(PipelineTest, CollectsMoveOnlyOutput) {
     const auto plan = into_inter(std::vector<int>{3}).map([](const int& value) {
         return std::make_unique<int>(value);
@@ -443,6 +466,39 @@ TEST(SchedulerTest, CollectBorrowsTheSameExecutorAcrossDifferentPipelines) {
     EXPECT_EQ(worker, first_worker);
 }
 
+TEST(SchedulerTest, DefaultCollectionsReuseWorkersAcrossCallingThreads) {
+    using Value = Range::value_type;
+    std::array<std::size_t, 2> background{};
+    std::array<std::size_t, 2> callers{};
+    for (std::size_t batch = 0; batch < background.size(); ++batch) {
+        std::thread caller([&, batch] {
+            callers[batch] = thread_token();
+            std::mutex mutex;
+            std::condition_variable ready;
+            std::size_t arrived = 0;
+            const auto result = Range(2).into_inter().iter_paral(2).map([&](Value value) {
+                std::unique_lock<std::mutex> lock(mutex);
+                const auto worker = thread_token();
+                if (worker != callers[batch]) {
+                    background[batch] = worker;
+                }
+                if (++arrived == 2) {
+                    ready.notify_one();
+                } else {
+                    EXPECT_TRUE(ready.wait_for(lock, std::chrono::seconds(5), [&] { return arrived == 2; }));
+                }
+                return value;
+            }).collect();
+            expect_value(result, std::vector<Value>{0, 1});
+        });
+        caller.join();
+    }
+    EXPECT_NE(callers[0], callers[1]);
+    EXPECT_NE(background[0], callers[0]);
+    EXPECT_NE(background[1], callers[1]);
+    EXPECT_EQ(background[0], background[1]);
+}
+
 TEST(SchedulerTest, NestedCollectorsCanRunWhileTheOuterTeamIsBusy) {
     using Value = Range::value_type;
     std::mutex mutex;
@@ -556,11 +612,61 @@ TEST(ChunkTest, RunsChunkBodiesAndPropagatesErrors) {
 }
 
 TEST(ChunkTest, HonorsGrainHint) {
-    std::atomic<std::size_t> largest{0};
+    std::mutex mutex;
+    std::size_t largest = 0;
     const auto ok = parallel::for_each_chunk(1000, 4, [&](std::size_t first, std::size_t last) {
-        largest.store(std::max(largest.load(), last - first), std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(mutex);
+        largest = std::max(largest, last - first);
     }, 100);
     EXPECT_TRUE(ok) << ok.error().message();
-    EXPECT_LE(largest.load(), 100u);
-    EXPECT_GT(largest.load(), 0u);
+    EXPECT_EQ(largest, 100u);
+}
+
+TEST(ChunkTest, DefaultGrainGrowsWithoutLosingAnyIndices) {
+    for (const auto size : {std::size_t{65539}, std::numeric_limits<std::size_t>::max()}) {
+        SCOPED_TRACE(size);
+        std::mutex mutex;
+        std::vector<std::pair<std::size_t, std::size_t>> chunks;
+        const auto result = parallel::for_each_chunk(size, 4, [&](std::size_t& first, std::size_t& last) {
+            std::lock_guard<std::mutex> lock(mutex);
+            chunks.emplace_back(first, last);
+        });
+        ASSERT_TRUE(result) << result.error().message();
+        std::sort(chunks.begin(), chunks.end());
+        std::size_t next = 0;
+        std::size_t largest = 0;
+        for (const auto& chunk : chunks) {
+            EXPECT_EQ(chunk.first, next);
+            ASSERT_LT(chunk.first, chunk.second);
+            ASSERT_LE(chunk.second, size);
+            largest = std::max(largest, chunk.second - chunk.first);
+            next = chunk.second;
+        }
+        EXPECT_EQ(next, size);
+        EXPECT_GT(largest, 64u);
+    }
+}
+
+TEST(ChunkTest, StaticScheduleUsesBalancedContiguousPartitions) {
+    constexpr std::size_t size = 17;
+    parallel::Executor executor(4, parallel::Schedule::static_partition);
+    std::mutex mutex;
+    std::vector<std::pair<std::size_t, std::size_t>> partitions;
+    const auto result = executor.run_chunks(size, [&](std::size_t first, std::size_t last) -> Result<void> {
+        std::lock_guard<std::mutex> lock(mutex);
+        partitions.emplace_back(first, last);
+        return outcome::success();
+    });
+    ASSERT_TRUE(result) << result.error().message();
+    std::sort(partitions.begin(), partitions.end());
+    const decltype(partitions) expected{{0, 5}, {5, 9}, {9, 13}, {13, 17}};
+    EXPECT_EQ(partitions, expected);
+
+    const auto stopped = executor.run_chunks(size, [](std::size_t, std::size_t) -> Result<void> {
+        return outcome::failure(std::error_code{});
+    });
+    ASSERT_FALSE(stopped);
+    EXPECT_EQ(stopped.error(), std::error_code{});
+    const auto plan = Range(size).into_inter().reduce(Range::value_type{0}, std::plus<>{});
+    expect_value(plan.collect_one(executor), 136);
 }

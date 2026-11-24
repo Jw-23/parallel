@@ -16,7 +16,7 @@
 
 namespace {
 
-using parallel::detail::Executor;
+using parallel::Executor;
 using ChunkWork = Executor::ChunkTask;
 namespace outcome = boost::outcome_v2;
 
@@ -100,6 +100,7 @@ enum class Scheduler {
     pipeline_collect,
     fresh_dynamic_chunks,
     reused_dynamic_chunks,
+    reused_static_chunks,
     fresh_mutex_pool,
     reused_mutex_pool,
 };
@@ -155,12 +156,12 @@ void compare_schedulers(benchmark::State& state, Scheduler scheduler, Workload w
         return outcome::success();
     };
 
-    Executor dynamic(workers);
+    const auto schedule = scheduler == Scheduler::reused_static_chunks
+        ? parallel::Schedule::static_partition : parallel::Schedule::dynamic;
+    Executor executor(workers, schedule);
     MutexPool locked(work);
-    if (scheduler == Scheduler::reused_dynamic_chunks &&
-        !succeeded(state, dynamic.run_chunks(size, [](std::size_t, std::size_t) -> parallel::Result<void> {
-            return outcome::success();
-        }))) {
+    if ((scheduler == Scheduler::reused_dynamic_chunks || scheduler == Scheduler::reused_static_chunks) &&
+        !succeeded(state, executor.run_chunks(size, work))) {
         return;
     }
     if (scheduler == Scheduler::reused_mutex_pool && !succeeded(state, locked.start(workers - 1))) {
@@ -179,14 +180,15 @@ void compare_schedulers(benchmark::State& state, Scheduler scheduler, Workload w
             break;
         }
         case Scheduler::fresh_dynamic_chunks: {
-            Executor executor(workers);
-            if (!succeeded(state, executor.run_chunks(size, work))) {
+            Executor fresh(workers);
+            if (!succeeded(state, fresh.run_chunks(size, work))) {
                 return;
             }
             break;
         }
         case Scheduler::reused_dynamic_chunks:
-            if (!succeeded(state, dynamic.run_chunks(size, work))) {
+        case Scheduler::reused_static_chunks:
+            if (!succeeded(state, executor.run_chunks(size, work))) {
                 return;
             }
             break;
@@ -313,6 +315,7 @@ const bool cases_registered = [] {
         {"PipelineCollect", Scheduler::pipeline_collect},
         {"FreshDynamicChunks", Scheduler::fresh_dynamic_chunks},
         {"ReusedDynamicChunks", Scheduler::reused_dynamic_chunks},
+        {"ReusedStaticChunks", Scheduler::reused_static_chunks},
         {"FreshMutexPool", Scheduler::fresh_mutex_pool},
         {"ReusedMutexPool", Scheduler::reused_mutex_pool},
     };
@@ -320,6 +323,7 @@ const bool cases_registered = [] {
         {"Uniform", {4096, 65536}, 24, 0},
         {"Uneven", {4096, 65536}, 8, 256},
         {"ShortTasks", {128, 4096}, 4, 0},
+        {"LightUniform", {65536, 1048576}, 4, 0},
         {"LongTasks", {8, 32}, 1u << 20, 0},
         {"TailHeavy", {4096, 65536}, 4, 1u << 14, true},
     };

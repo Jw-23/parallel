@@ -35,6 +35,9 @@ using Result = boost::outcome_v2::std_result<T, ErrorCode, boost::outcome_v2::po
 enum class Errc { unexpected_exception = 1 };
 ErrorCode make_error_code(Errc error) noexcept;
 
+// Dynamic workers share chunks. Static workers each own a balanced contiguous partition.
+enum class Schedule { dynamic, static_partition };
+
 template<class Evaluate, bool InPlace>
 class Pipeline;
 
@@ -215,28 +218,89 @@ auto call(const Function& function, Args&&... args) {
 class Executor {
 public:
     using ChunkTask = std::function<Result<void>(std::size_t, std::size_t)>;
-    enum class Reuse { evaluation, calling_thread };
+    enum class Reuse { evaluation, shared, calling_thread = shared };
 
     explicit Executor(std::size_t workers, Reuse reuse = Reuse::evaluation) noexcept;
+    Executor(std::size_t workers, Schedule schedule, Reuse reuse = Reuse::evaluation) noexcept;
     ~Executor();
 
     std::size_t worker_limit() const noexcept { return worker_limit_; }
     Result<void> run_chunks(std::size_t size, const ChunkTask& run, std::size_t grain_hint = 0);
 
+    template<class Function>
+    Result<void> run_borrowed_chunks(std::size_t size, const Function& run, std::size_t grain_hint = 0) {
+        // Borrow the callable for this synchronous batch, including plain function references.
+        const auto callback = [&](std::size_t first, std::size_t last) -> decltype(auto) {
+            return detail::invoke(run, std::move(first), std::move(last));
+        };
+        using Callback = decltype(callback);
+        return submit(size, {&callback, [](const void* object, std::size_t first,
+                                            std::size_t last, ErrorCode& error) {
+            const auto& apply = *static_cast<const Callback*>(object);
+            return invoke_chunk(apply, first, last, error, std::is_void<decltype(apply(first, last))>{});
+        }}, grain_hint);
+    }
+
 private:
+    struct ChunkCallback {
+        const void* object;
+        bool (*invoke)(const void*, std::size_t, std::size_t, ErrorCode&);
+
+        bool operator()(std::size_t first, std::size_t last, ErrorCode& error) const {
+            return invoke(object, first, last, error);
+        }
+    };
+
     struct Team;
     struct TeamCache;
-    void acquire_team();
+    struct Batch;
+    void acquire_team(std::size_t background_workers);
+    Result<void> submit(std::size_t size, ChunkCallback run, std::size_t grain_hint);
+
+    template<class Callback>
+    static bool invoke_chunk(const Callback& apply, std::size_t first, std::size_t last,
+                             ErrorCode&, std::true_type) {
+        apply(first, last);
+        return true;
+    }
+
+    template<class Callback>
+    static bool invoke_chunk(const Callback& apply, std::size_t first, std::size_t last,
+                             ErrorCode& error, std::false_type) {
+        const auto result = chunk_result(apply(first, last));
+        if (result) {
+            return true;
+        }
+        error = result.assume_error();
+        return false;
+    }
+
+    static Result<void> chunk_result(Result<void> result) { return result; }
+
+    template<class E, class Policy>
+    static Result<void> chunk_result(outcome::basic_result<void, E, Policy> result) {
+        return into_result(std::move(result));
+    }
 
     std::size_t worker_limit_;
     Reuse reuse_;
-    TeamCache* cache_ = nullptr;
+    Schedule schedule_;
+    std::shared_ptr<TeamCache> cache_;
     std::unique_ptr<Team> team_;
 };
 
 template<class Function>
-Result<void> for_each_index(std::size_t size, Executor& executor, const Function& apply) {
-    return executor.run_chunks(size, [&](std::size_t first, std::size_t last) -> Result<void> {
+Result<void> for_each_index(std::size_t size, Executor& executor, const Function& apply, std::true_type) {
+    return executor.run_borrowed_chunks(size, [&](std::size_t first, std::size_t last) {
+        for (auto i = first; i < last; ++i) {
+            detail::invoke(apply, i);
+        }
+    });
+}
+
+template<class Function>
+Result<void> for_each_index(std::size_t size, Executor& executor, const Function& apply, std::false_type) {
+    return executor.run_borrowed_chunks(size, [&](std::size_t first, std::size_t last) -> Result<void> {
         for (auto i = first; i < last; ++i) {
             const auto applied = call(apply, i);
             if (!applied) {
@@ -245,6 +309,11 @@ Result<void> for_each_index(std::size_t size, Executor& executor, const Function
         }
         return outcome::success();
     });
+}
+
+template<class Function>
+Result<void> for_each_index(std::size_t size, Executor& executor, const Function& apply) {
+    return for_each_index(size, executor, apply, std::is_void<Invocation<const Function&, std::size_t&>>{});
 }
 
 using std::begin;
@@ -548,6 +617,64 @@ template<class Evaluate>
 using PlanStorage = typename Invocation<const Evaluate&, Executor&>::value_type;
 
 template<class Parent, class Function>
+class MapStage {
+    using Input = PlanStorage<Parent>;
+    using Argument = const typename Input::value_type&;
+    using Callback = Invocation<const Function&, Argument>;
+    using Output = Values<CallbackValue<const Function&, Argument>>;
+    using CanRecycle = std::integral_constant<bool, Output::direct && std::is_same<Input, Output>::value>;
+
+public:
+    MapStage(std::shared_ptr<const Parent> parent, Function transform)
+        : parent_(std::move(parent)), transform_(std::move(transform)) {}
+
+    Result<Output> operator()(Executor& executor) const {
+        Output spare;
+        return evaluate_with_buffer(executor, spare);
+    }
+
+    // Adjacent arithmetic stages reuse the buffer from two stages back.
+    // Each stage still reads a complete, stable input and finishes before the next one starts.
+    Result<Output> evaluate_with_buffer(Executor& executor, Output& spare) const {
+        auto input_result = evaluate_parent(*parent_, executor, spare, 0);
+        if (!input_result) {
+            return input_result.as_failure();
+        }
+        auto& input = input_result.assume_value();
+        Output output;
+        output.swap(spare);
+        output.resize(input.size());
+        using ReturnsResult = typename ResultTraits<std::decay_t<Callback>>::type;
+        const auto mapped = for_each_index(input.size(), executor, [&](std::size_t i) -> decltype(auto) {
+            Argument value = input.read(i);
+            return map_value(output, i, value, transform_, ReturnsResult{});
+        });
+        if (!mapped) {
+            return mapped.as_failure();
+        }
+        recycle(input, spare, CanRecycle{});
+        return outcome::success(std::move(output));
+    }
+
+private:
+    template<class Plan, bool Direct = Output::direct, std::enable_if_t<Direct, int> = 0>
+    static auto evaluate_parent(const Plan& plan, Executor& executor, Output& spare, int)
+        -> decltype(plan.evaluate_with_buffer(executor, spare)) {
+        return plan.evaluate_with_buffer(executor, spare);
+    }
+
+    static Result<Input> evaluate_parent(const Parent& parent, Executor& executor, Output&, long) {
+        return parent(executor);
+    }
+
+    static void recycle(Input& input, Output& spare, std::true_type) noexcept { spare.swap(input); }
+    static void recycle(Input&, Output&, std::false_type) noexcept {}
+
+    std::shared_ptr<const Parent> parent_;
+    Function transform_;
+};
+
+template<class Parent, class Function>
 class MapPlan;
 
 template<class Evaluate>
@@ -620,13 +747,12 @@ public:
         }
         const auto& input = prepared.assume_value();
         Values<Value> output(input.size());
-        const auto mapped = executor.run_chunks(input.size(), [&](std::size_t first, std::size_t last) -> Result<void> {
+        const auto mapped = executor.run_borrowed_chunks(input.size(), [&](std::size_t first, std::size_t last) {
             // Snapshot Range's metadata in the loop's local reader. Materialized input stays borrowed.
             const auto reader = input.for_chunk();
             for (auto i = first; i < last; ++i) {
                 output.put(i, reader.read(i));
             }
-            return outcome::success();
         });
         if (!mapped) {
             return mapped.as_failure();
@@ -690,23 +816,25 @@ Result<A> reduce(const S& input, const A& initial, const F& combine, Executor& e
 
 }  // namespace detail
 
+using Executor = detail::Executor;
+
 // Run `apply(first, last)` over arbitrary half-open chunks of [0, size). This
 // is the chunk-level primitive behind the collection pipeline; it is useful
 // when the body is a cache-friendly loop over several arrays rather than a
-// per-element transform. The calling thread participates, and a single idle
-// team is reused between calls from the same thread. A callback may return
-// void or Result<void>.
+// per-element transform. The calling thread participates, and idle teams can
+// be reused across callers. A callback may return void or Result<void>. A
+// nonzero grain hint limits chunk width when the batch runs in parallel.
 template<class Function>
 Result<void> for_each_chunk(std::size_t size, std::size_t workers, const Function& apply,
                             std::size_t grain_hint = 0) {
-    detail::Executor executor(workers, detail::Executor::Reuse::calling_thread);
-    return executor.run_chunks(size, [&](std::size_t first, std::size_t last) {
-        return detail::call(apply, first, last);
+    Executor executor(workers, Executor::Reuse::shared);
+    return executor.run_borrowed_chunks(size, [&](std::size_t first, std::size_t last) -> decltype(auto) {
+        return detail::invoke(apply, first, last);
     }, grain_hint);
 }
 
 // Operations build reusable plans. Each collection evaluates the plan again.
-// A calling thread can retain one idle team between collections.
+// Idle teams can be reused between collections by any calling thread.
 // Borrowed sources must remain alive and structurally stable during evaluation.
 // Parallel callbacks may run concurrently and must synchronize any shared state.
 // Callbacks can return plain values (or void) or an Outcome result with an error code.
@@ -729,27 +857,7 @@ public:
 
     template<class Function, bool Mutable = InPlace, std::enable_if_t<!Mutable, int> = 0>
     auto map(Function transform) const {
-        using Output = detail::Values<detail::CallbackValue<const Function&, const value_type&>>;
-        return next([parent = evaluate_, transform = std::move(transform)](detail::Executor& executor)
-                        -> Result<Output> {
-            auto input_result = (*parent)(executor);
-            if (!input_result) {
-                return input_result.as_failure();
-            }
-            auto& input = input_result.assume_value();
-            Output output(input.size());
-            using Callback = detail::Invocation<const Function&, const value_type&>;
-            using ReturnsResult = typename detail::ResultTraits<std::decay_t<Callback>>::type;
-            const auto map_index = [&](std::size_t i) -> decltype(auto) {
-                const value_type& value = input.read(i);
-                return detail::map_value(output, i, value, transform, ReturnsResult{});
-            };
-            const auto mapped = detail::for_each_index(input.size(), executor, map_index);
-            if (!mapped) {
-                return mapped.as_failure();
-            }
-            return detail::outcome::success(std::move(output));
-        });
+        return next(detail::MapStage<Evaluate, Function>(evaluate_, std::move(transform)));
     }
 
     // A pure transform may run together with another stage on each element. It
@@ -877,8 +985,8 @@ public:
                 return input_result.as_failure();
             }
             auto& input = input_result.assume_value();
-            const auto updated = detail::for_each_index(input.size(), executor, [&](std::size_t i) {
-                return detail::call(change, input.write(i));
+            const auto updated = detail::for_each_index(input.size(), executor, [&](std::size_t i) -> decltype(auto) {
+                return detail::invoke(change, input.write(i));
             });
             if (!updated) {
                 return updated.as_failure();
@@ -949,11 +1057,11 @@ public:
     }
 
     Result<std::vector<value_type>> collect() const noexcept {
-        Executor executor(workers_, Executor::Reuse::calling_thread);
+        Executor executor(workers_, Executor::Reuse::shared);
         return collect(executor);
     }
 
-    // Borrows the executor for this call. Its worker limit controls execution.
+    // Borrows the executor for this call. Its worker limit and schedule control execution.
     // Use one collection at a time per executor, including nested collections.
     Result<std::vector<value_type>> collect(Executor& executor) const noexcept {
         return detail::run_safe([&]() -> Result<std::vector<value_type>> {
@@ -966,8 +1074,12 @@ public:
     }
 
     Result<value_type> collect_one() const noexcept {
+        Executor executor(workers_, Executor::Reuse::shared);
+        return collect_one(executor);
+    }
+
+    Result<value_type> collect_one(Executor& executor) const noexcept {
         return detail::run_safe([&]() -> Result<value_type> {
-            detail::Executor executor(workers_, detail::Executor::Reuse::calling_thread);
             auto values_result = (*evaluate_)(executor);
             if (!values_result) {
                 return values_result.as_failure();
@@ -989,7 +1101,7 @@ private:
         Result<WritableStorage>& values() {
             if (!cache) {
                 cache.emplace(detail::run_safe([&]() -> Result<WritableStorage> {
-                    detail::Executor executor(workers, detail::Executor::Reuse::calling_thread);
+                    Executor executor(workers, Executor::Reuse::shared);
                     auto source_result = (*evaluate)(executor);
                     if (!source_result) {
                         return source_result.as_failure();
