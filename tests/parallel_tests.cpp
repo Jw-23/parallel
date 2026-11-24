@@ -2,6 +2,10 @@
 
 #include <gtest/gtest.h>
 
+#ifdef PARALLEL_TEST_BOOST_CONTAINER
+#include <boost/container/pmr/monotonic_buffer_resource.hpp>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -17,6 +21,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -26,6 +31,7 @@ namespace {
 using parallel::Range;
 using parallel::Result;
 using parallel::into_inter;
+using parallel::into_inter_paral;
 using parallel::iter;
 using parallel::iter_paral;
 namespace outcome = boost::outcome_v2;
@@ -46,7 +52,13 @@ template<class T, class = void>
 struct SupportsIter : std::false_type {};
 
 template<class T>
-struct SupportsIter<T, boost::compat::void_t<decltype(iter(std::declval<T>()))>> : std::true_type {};
+struct SupportsIter<T, parallel::detail::void_t<decltype(iter(std::declval<T>()))>> : std::true_type {};
+
+template<class T, class = void>
+struct SupportsIntoInter : std::false_type {};
+
+template<class T>
+struct SupportsIntoInter<T, parallel::detail::void_t<decltype(into_inter(std::declval<T>()))>> : std::true_type {};
 
 struct MissingEnd {
     int* begin() const;
@@ -66,7 +78,10 @@ bool operator!=(const int* position, Sentinel sentinel) { return position != sen
 
 static_assert(!SupportsIter<int>::value, "scalar values are not iterable");
 static_assert(!SupportsIter<MissingEnd>::value, "iterability requires an end");
-static_assert(SupportsIter<AdlRange>::value, "ADL begin and end are supported");
+static_assert(SupportsIter<AdlRange&>::value, "ADL begin and end are supported");
+static_assert(!SupportsIter<AdlRange>::value, "the borrowing entry point requires an lvalue");
+static_assert(!SupportsIntoInter<std::vector<int>&>::value, "ownership transfer requires an rvalue");
+static_assert(!SupportsIntoInter<int*>::value, "raw pointers are borrowed");
 static_assert(std::is_same<parallel::ErrorCode, std::error_code>::value, "use the standard error code");
 
 TEST(RangeTest, SupportsDescendingAndEmptyRanges) {
@@ -91,7 +106,7 @@ TEST(RangeTest, HandlesExtremeStridesAndRejectsZero) {
 TEST(PipelineTest, SupportsAdlSentinelsAndPackedBooleanOutput) {
     expect_value(into_inter(AdlRange{}).collect(), std::vector<int>{4, 5, 6});
     const std::vector<bool> flags{true, false, true};
-    expect_value(into_inter(flags).iter_paral(2).map(std::logical_not<>{}).collect(),
+    expect_value(iter_paral(flags, 2).map(std::logical_not<>{}).collect(),
                  std::vector<bool>{false, true, false});
 }
 
@@ -99,7 +114,7 @@ TEST(PipelineTest, EvaluatesOnTraversalOrCollection) {
     std::vector<int> input{1, 2, 3, 4};
     const auto caller = std::this_thread::get_id();
     int calls = 0;
-    const auto mapped = into_inter(input).map([&](const int& value) {
+    const auto mapped = iter(input).map([&](const int& value) {
         EXPECT_EQ(std::this_thread::get_id(), caller);
         ++calls;
         return value * 3;
@@ -125,7 +140,7 @@ TEST(PipelineTest, EvaluatesOnTraversalOrCollection) {
                  std::vector<std::pair<int, std::int64_t>>{{3, 0}, {18, 1}});
 }
 
-TEST(PipelineTest, ArithmeticMapChainCompletesEachStageBeforeTheNext) {
+TEST(PipelineTest, MaterializeCompletesEachStageBeforeTheNext) {
     using Value = Range::value_type;
     constexpr Value size = 1000;
     std::array<std::atomic<Value>, 4> finished;
@@ -142,8 +157,11 @@ TEST(PipelineTest, ArithmeticMapChainCompletesEachStageBeforeTheNext) {
         };
     };
 
-    const auto result = Range(size).into_inter().iter_paral(4)
-        .map(stage(0)).map(stage(1)).map(stage(2)).map(stage(3)).collect();
+    const auto result = Range(size).iter_paral(4)
+        .map(stage(0)).materialize()
+        .map(stage(1)).materialize()
+        .map(stage(2)).materialize()
+        .map(stage(3)).collect();
     const Range expected(4, size + 4);
     expect_value(result, std::vector<Value>(expected.begin(), expected.end()));
 }
@@ -158,13 +176,13 @@ TEST(PipelineTest, CollectsMoveOnlyOutput) {
     EXPECT_EQ(*result.value(), 3);
 }
 
-TEST(PipelineTest, ComposesFourPureMapsAcrossDifferentTypes) {
+TEST(PipelineTest, FusesFourMapsAcrossDifferentTypes) {
     std::vector<int> input{1, 2, 3, 4};
-    const auto plan = into_inter(input).iter_paral(3)
-        .map_pure([](const int& value) { return value * 2; })
-        .map_pure([](const int& value) { return std::make_unique<int>(value); })
-        .map_pure([](const std::unique_ptr<int>& value) { return std::to_string(*value); })
-        .map_pure([](const std::string& value) { return "value=" + value; });
+    const auto plan = iter_paral(input, 3)
+        .map([](const int& value) { return value * 2; })
+        .map([](const int& value) { return std::make_unique<int>(value); })
+        .map([](const std::unique_ptr<int>& value) { return std::to_string(*value); })
+        .map([](const std::string& value) { return "value=" + value; });
     input[1] = 8;
     const std::vector<std::string> expected{"value=2", "value=16", "value=6", "value=8"};
     expect_value(plan.collect(), expected);
@@ -172,18 +190,18 @@ TEST(PipelineTest, ComposesFourPureMapsAcrossDifferentTypes) {
     EXPECT_EQ(input, (std::vector<int>{1, 8, 3, 4}));
 
     const auto twice = [](std::int64_t value) { return value * 2; };
-    expect_value(Range(4, 0, -1).into_inter().iter_paral(3).map_pure(twice).map_pure(twice).collect(),
+    expect_value(Range(4, 0, -1).iter_paral(3).map(twice).map(twice).collect(),
                  (std::vector<std::int64_t>{16, 12, 8, 4}));
-    expect_value(Range(0).into_inter().map_pure(twice).collect(), std::vector<std::int64_t>{});
-    expect_error(Range(0, 1, 0).into_inter().map_pure(twice).map_pure(twice).collect(),
+    expect_value(Range(0).into_inter().map(twice).collect(), std::vector<std::int64_t>{});
+    expect_error(Range(0, 1, 0).into_inter().map(twice).map(twice).collect(),
                  std::errc::invalid_argument);
 }
 
-TEST(PipelineTest, BorrowsMaterializedMoveOnlyValuesDuringFusedCollection) {
-    const auto plan = Range(128).into_inter().iter_paral(4)
-        .map([](auto value) { return std::make_unique<Range::value_type>(value); })
-        .map_pure([](const auto& value) { return *value; })
-        .map_pure([](auto value) { return value * 3; });
+TEST(PipelineTest, MovesMaterializedValuesIntoFusedCallbacks) {
+    const auto plan = Range(128).iter_paral(4)
+        .map([](auto value) { return std::make_unique<Range::value_type>(value); }).materialize()
+        .map([](std::unique_ptr<Range::value_type> value) { return *value; })
+        .map([](auto value) { return value * 3; });
 
     const Range expected(0, 384, 3);
     expect_value(plan.collect(), (std::vector<Range::value_type>(expected.begin(), expected.end())));
@@ -195,22 +213,114 @@ TEST(PipelineTest, ExposesWritableReferencesAndUpdatesArrays) {
         value += 1;
     }
     EXPECT_EQ(values, (std::list<int>{2, 3, 4, 5}));
-    static_assert(std::is_same<decltype(*into_inter(values).begin()), const int&>::value,
+    static_assert(std::is_same<decltype(*iter(static_cast<const std::list<int>&>(values)).begin()), const int&>::value,
                   "read-only traversal exposes const references");
 
     int array[]{1, 2, 3};
-    expect_value(iter(array).map([](int& value) { value += 1; }).collect(), std::vector<int>{2, 3, 4});
-    EXPECT_EQ(array[2], 4);
-    expect_value(Range(3).iter().update([](auto& value) { value *= 2; }).collect(),
+    for (auto& value : iter(array)) {
+        ++value;
+    }
+    expect_value(iter(array).collect(), std::vector<int>{2, 3, 4});
+    expect_value(Range(3).iter().map([](auto value) { return value * 2; }).collect(),
                  std::vector<std::int64_t>{0, 2, 4});
 }
 
+TEST(PipelineTest, SupportsSizedAndSingleBorrowedPointers) {
+    int array[]{4, 5, 6};
+    int* pointer = array;
+    expect_value(iter(pointer).collect(), std::vector<int>{4});
+    expect_value(iter(array).collect(), std::vector<int>{4, 5, 6});
+    expect_value(iter_paral(pointer, 3, 2).map([](int value) { return value * 2; }).collect(),
+                 std::vector<int>{8, 10, 12});
+    const int* empty = nullptr;
+    expect_value(iter(empty, 0).collect(), std::vector<int>{});
+    expect_error(iter_paral(empty, 1, 2).collect(), std::errc::invalid_argument);
+}
+
+TEST(PipelineTest, ConsumesMoveOnlyRangesAndBuffersOnce) {
+    std::vector<std::unique_ptr<int>> source;
+    source.emplace_back(std::make_unique<int>(4));
+    source.emplace_back(std::make_unique<int>(7));
+    expect_value(iter(source).map([](const std::unique_ptr<int>& value) { return *value; }).collect(),
+                 std::vector<int>{4, 7});
+    expect_value(iter_paral(source, 2).filter([](const auto& value) { return *value > 4; })
+                     .map([](const auto& value) { return *value; }).collect(), std::vector<int>{7});
+    ASSERT_NE(source.front(), nullptr);
+    const auto plan = into_inter_paral(std::move(source), 2).map([](std::unique_ptr<int> value) { return *value; });
+    const auto copy = plan;
+    expect_value(plan.collect(), std::vector<int>{4, 7});
+    expect_error(copy.collect(), std::errc::operation_not_permitted);
+
+    auto buffer = std::make_unique<std::unique_ptr<int>[]>(2);
+    buffer[0] = std::make_unique<int>(1);
+    buffer[1] = std::make_unique<int>(2);
+    auto owned = into_inter(std::move(buffer), 2).collect();
+    ASSERT_TRUE(owned) << owned.error().message();
+    ASSERT_NE(owned.value()[1], nullptr);
+    EXPECT_EQ(*owned.value()[1], 2);
+}
+
+TEST(PipelineTest, EnumeratePreservesReferencesAndUsesPipelineOrder) {
+    std::vector<int> source{1, 2, 3, 4};
+    for (auto item : iter(source).enumerate()) {
+        std::get<1>(item) += static_cast<int>(std::get<0>(item));
+    }
+    EXPECT_EQ(source, (std::vector<int>{1, 3, 5, 7}));
+
+    using Item = std::tuple<std::size_t, int>;
+    expect_value(iter_paral(source, 3).filter([](int value) { return value >= 5; }).enumerate().collect(),
+                 std::vector<Item>{{0, 5}, {1, 7}});
+    expect_value(iter_paral(source, 3).enumerate().filter([](const Item& item) { return std::get<1>(item) >= 5; }).collect(),
+                 std::vector<Item>{{2, 5}, {3, 7}});
+    expect_value(iter(source).enumerate().map([](std::tuple<std::size_t, int&> item) {
+        return std::get<0>(item) + static_cast<std::size_t>(std::get<1>(item));
+    }).collect(), std::vector<std::size_t>{1, 4, 7, 10});
+}
+
+TEST(PipelineTest, FusedErrorsSkipTheRestOfTheFailedElement) {
+    const auto error = std::make_error_code(std::errc::invalid_argument);
+    std::vector<Range::value_type> seen;
+    const auto collected = Range(4).iter().map([&](Range::value_type value) -> Result<Range::value_type> {
+        return value == 1 ? Result<Range::value_type>(outcome::failure(error))
+                          : Result<Range::value_type>(outcome::success(value));
+    }).enumerate().map([&](const auto& item) {
+        seen.push_back(std::get<1>(item));
+        return std::get<1>(item);
+    }).collect();
+    expect_error(collected, error);
+    EXPECT_EQ(seen, (std::vector<Range::value_type>{0}));
+}
+
+TEST(PipelineTest, InvokesMemberPointersAndPropagatesZippedErrors) {
+    struct Sample {
+        int value;
+        int twice() const { return value * 2; }
+    };
+    std::vector<Sample> samples{{2}, {3}};
+    expect_value(iter(samples).map(&Sample::value).collect(), std::vector<int>{2, 3});
+    expect_value(iter(samples).map(&Sample::twice).collect(), std::vector<int>{4, 6});
+    auto right = Range(0, 1, 0).iter();
+    expect_error(iter(samples).zip(right).collect(), std::errc::invalid_argument);
+}
+
+#ifdef PARALLEL_TEST_BOOST_CONTAINER
+TEST(PipelineTest, UsesBoostMonotonicScratchWithoutTyingTheOutputToIt) {
+    std::list<int> source{1, 2, 3, 4};
+    alignas(int) unsigned char buffer[4096];
+    boost::container::pmr::monotonic_buffer_resource scratch(buffer, sizeof(buffer));
+    const auto available = scratch.remaining_storage();
+    const auto result = iter_paral(source, 2).filter([](int value) { return value > 1; }).collect({&scratch});
+    EXPECT_LT(scratch.remaining_storage(), available);
+    scratch.release();
+    expect_value(result, std::vector<int>{2, 3, 4});
+}
+#endif
+
 TEST(LayerPlanTest, ReadsOneStablePreviousLayerPerRound) {
-    std::list<int> values{1, 2, 3, 4};
+    std::list<int> values{10, 20, 30, 40};
     const auto caller = std::this_thread::get_id();
     std::size_t advanced = 0;
     const auto plan = iter_paral(values, 3)
-        .map([](int& value) { value *= 10; })
         .layer_plan(std::size_t{0}, [](std::size_t i, const auto& previous, std::size_t round) {
             if (round == 0) {
                 return previous[i] + previous[(i + previous.size() - 1) % previous.size()];
@@ -223,7 +333,7 @@ TEST(LayerPlanTest, ReadsOneStablePreviousLayerPerRound) {
             ++advanced;
             return round + 1;
         }, [](std::size_t round) { return round == 2; });
-    EXPECT_EQ(values, (std::list<int>{1, 2, 3, 4}));
+    EXPECT_EQ(values, (std::list<int>{10, 20, 30, 40}));
     EXPECT_EQ(advanced, 0u);
     expect_value(plan.collect(), std::vector<int>{30, 50, 70, 50});
     EXPECT_EQ(advanced, 2u);
@@ -283,30 +393,30 @@ TEST(LayerPlanTest, KeepsPendingLayerPrivateOnStateError) {
 }
 
 TEST(ReduceTest, AppliesSeedOnceAndKeepsOperandOrder) {
-    const auto sum = Range(1000).into_inter().iter_paral(4).reduce(std::int64_t{7}, std::plus<>{});
+    const auto sum = Range(1000).iter_paral(4).reduce(std::int64_t{7}, std::plus<>{});
     expect_value(sum.collect_one(), 499507);
     expect_value(Range(0).iter_paral(4).reduce(std::int64_t{7}, std::plus<>{}).collect_one(), 7);
 
     const std::vector<std::string> words{"a", "b", "c", "d", "e", "f", "g"};
-    expect_value(into_inter(words).iter_paral(3).reduce(std::string("!"), std::plus<>{}).collect_one(),
+    expect_value(iter_paral(words, 3).reduce(std::string("!"), std::plus<>{}).collect_one(),
                  std::string("!abcdefg"));
-    expect_value(into_inter(words).iter_paral(3)
-                     .map_pure([](const auto& word) { return word.size(); })
+    expect_value(iter_paral(words, 3)
+                     .map([](const auto& word) { return word.size(); })
                      .reduce(std::size_t{0}, std::plus<>{}).collect_one(),
                  std::size_t{7});
 }
 
-TEST(ReduceTest, ReducesPureMapOnMultipleWorkers) {
+TEST(ReduceTest, ReducesFusedMapOnMultipleWorkers) {
     using Value = Range::value_type;
     std::mutex mutex;
     std::condition_variable ready;
     std::thread::id first_worker;
     bool used_second_worker = false;
-    const auto sum = Range(128).into_inter().iter_paral(2)
-        .map_pure([](Value value) { return value + 10; })
-        .map_pure([](Value value) { return value + 20; })
-        .map_pure([](Value value) { return value + 30; })
-        .map_pure([](Value value) { return value + 40; })
+    const auto sum = Range(128).iter_paral(2)
+        .map([](Value value) { return value + 10; })
+        .map([](Value value) { return value + 20; })
+        .map([](Value value) { return value + 30; })
+        .map([](Value value) { return value + 40; })
         .reduce(Value{7}, [&](Value a, Value b) {
             const auto worker = std::this_thread::get_id();
             std::unique_lock<std::mutex> lock(mutex);
@@ -335,14 +445,14 @@ TEST(PipelineErrorsTest, PropagatesCallbackErrorsAndSkipsDownstreamStages) {
 
     for (auto workers : {std::size_t{1}, std::size_t{4}}) {
         SCOPED_TRACE(workers);
-        const auto plan = Range(16).into_inter().iter_paral(workers).map(fail_on_three);
-        const auto downstream = plan.map([](Value value) {
+        const auto plan = Range(16).iter_paral(workers).map(fail_on_three);
+        const auto downstream = plan.materialize().map([](Value value) {
             ADD_FAILURE() << "a failed stage must skip downstream callbacks";
             return value;
         }).collect();
         expect_error(downstream, std::errc::permission_denied);
-        expect_error(plan.map_pure([](Value value) { return value + 1; })
-                         .map_pure([](Value value) { return value * 2; })
+        expect_error(plan.map([](Value value) { return value + 1; })
+                         .map([](Value value) { return value * 2; })
                          .reduce(Value{0}, std::plus<>{}).collect_one(),
                      std::errc::permission_denied);
         const auto first = plan.begin();
@@ -365,7 +475,7 @@ TEST(PipelineErrorsTest, TranslatesExceptionsAndRejectsWrongCollectionSize) {
     for (auto workers : {std::size_t{1}, std::size_t{4}}) {
         SCOPED_TRACE(workers);
         const std::vector<Value> empty;
-        const auto failed = Range(4).into_inter().iter_paral(workers).map([&](Value) {
+        const auto failed = Range(4).iter_paral(workers).map([&](Value) {
             return empty.at(0);
         }).collect();
         expect_error(failed, parallel::make_error_code(parallel::Errc::unexpected_exception));
@@ -409,10 +519,9 @@ TEST(SchedulerTest, ReusesWorkersAcrossStagesAndRepeatedCollects) {
         return value;
     };
 
-    const auto plan = Range(2).into_inter().iter_paral(2)
-        .map([&](Value value) { return record(0, value); })
+    const auto plan = Range(2).iter_paral(2)
+        .map([&](Value value) { return record(0, value); }).materialize()
         .map([&](Value value) { return record(1, value); })
-        .iter().iter_paral(2)
         .layer_plan(std::size_t{0}, [&](std::size_t i, const auto& previous, std::size_t round) {
             return record(2 + round, previous[i]);
         }, [](std::size_t round, const auto&, const auto&) { return round + 1; },
@@ -476,7 +585,7 @@ TEST(SchedulerTest, DefaultCollectionsReuseWorkersAcrossCallingThreads) {
             std::mutex mutex;
             std::condition_variable ready;
             std::size_t arrived = 0;
-            const auto result = Range(2).into_inter().iter_paral(2).map([&](Value value) {
+            const auto result = Range(2).iter_paral(2).map([&](Value value) {
                 std::unique_lock<std::mutex> lock(mutex);
                 const auto worker = thread_token();
                 if (worker != callers[batch]) {
@@ -504,7 +613,7 @@ TEST(SchedulerTest, NestedCollectorsCanRunWhileTheOuterTeamIsBusy) {
     std::mutex mutex;
     std::condition_variable ready;
     int arrived = 0;
-    const auto result = Range(2).into_inter().iter_paral(2).map([&](Value value) -> Result<Value> {
+    const auto result = Range(2).iter_paral(2).map([&](Value value) -> Result<Value> {
         {
             std::unique_lock<std::mutex> lock(mutex);
             if (++arrived == 2) {
@@ -513,7 +622,7 @@ TEST(SchedulerTest, NestedCollectorsCanRunWhileTheOuterTeamIsBusy) {
                 EXPECT_TRUE(ready.wait_for(lock, std::chrono::seconds(5), [&] { return arrived == 2; }));
             }
         }
-        auto inner = Range(value, value + 2).into_inter().iter_paral(2).map([](Value i) {
+        auto inner = Range(value, value + 2).iter_paral(2).map([](Value i) {
             return i + 1;
         }).collect();
         if (!inner) {

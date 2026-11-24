@@ -146,7 +146,7 @@ void compare_schedulers(benchmark::State& state, Scheduler scheduler, Workload w
     };
     // Build the lazy plan before timing its collection.
     using Index = parallel::Range::value_type;
-    const auto pipeline = parallel::Range(static_cast<Index>(size)).into_inter().iter_paral(workers)
+    const auto pipeline = parallel::Range(static_cast<Index>(size)).iter_paral(workers)
         .map([&](const Index& index) { return calculate(static_cast<std::size_t>(index)); });
     std::vector<std::uint64_t> output(scheduler == Scheduler::pipeline_collect ? 0 : size);
     const ChunkWork work = [&](std::size_t first, std::size_t last) -> parallel::Result<void> {
@@ -230,18 +230,18 @@ const auto halve = [](Index value) { return value / 2; };
 
 template<class Source>
 auto map_chain(const Source& source, std::false_type) {
-    return source.map(increment).map(scale).map(scramble).map(halve);
+    return source.map(increment).materialize().map(scale).materialize().map(scramble).materialize().map(halve);
 }
 
 template<class Source>
 auto map_chain(const Source& source, std::true_type) {
-    return source.map_pure(increment).map_pure(scale).map_pure(scramble).map_pure(halve);
+    return source.map(increment).map(scale).map(scramble).map(halve);
 }
 
 template<bool Fused>
 void collect_maps(benchmark::State& state) {
     const auto size = static_cast<Index>(state.range(0));
-    const auto source = parallel::Range(size).into_inter().iter_paral(static_cast<std::size_t>(state.range(1)));
+    const auto source = parallel::Range(size).iter_paral(static_cast<std::size_t>(state.range(1)));
     const auto plan = map_chain(source, std::integral_constant<bool, Fused>{});
     for (auto iteration : state) {
         static_cast<void>(iteration);
@@ -279,7 +279,7 @@ void collect_maps_loop(benchmark::State& state) {
 template<bool Fused>
 void reduce_maps(benchmark::State& state) {
     const auto size = static_cast<Index>(state.range(0));
-    const auto source = parallel::Range(size).into_inter().iter_paral(static_cast<std::size_t>(state.range(1)));
+    const auto source = parallel::Range(size).iter_paral(static_cast<std::size_t>(state.range(1)));
     const auto plan = map_chain(source, std::integral_constant<bool, Fused>{}).reduce(Index{0}, std::plus<>{});
     for (auto iteration : state) {
         static_cast<void>(iteration);
