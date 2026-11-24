@@ -412,6 +412,37 @@ TEST(SchedulerTest, ReusesWorkersAcrossStagesAndRepeatedCollects) {
     }
 }
 
+TEST(SchedulerTest, CollectBorrowsTheSameExecutorAcrossDifferentPipelines) {
+    using Value = Range::value_type;
+    parallel::Executor executor(2);
+    const auto caller = thread_token();
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::size_t arrived = 0;
+    std::size_t worker = caller;
+    const auto record = [&](Value value) {
+        std::unique_lock<std::mutex> lock(mutex);
+        const auto token = thread_token();
+        if (token != caller) {
+            worker = token;
+        }
+        if (++arrived == 2) {
+            ready.notify_all();
+        } else {
+            EXPECT_TRUE(ready.wait_for(lock, std::chrono::seconds(5), [&] { return arrived == 2; }));
+        }
+        return value;
+    };
+
+    expect_value(Range(2).into_inter().map(record).collect(executor), std::vector<Value>{0, 1});
+    ASSERT_NE(worker, caller);
+    const auto first_worker = worker;
+    arrived = 0;
+    worker = caller;
+    expect_value(Range(2, 4).into_inter().map(record).collect(executor), std::vector<Value>{2, 3});
+    EXPECT_EQ(worker, first_worker);
+}
+
 TEST(SchedulerTest, NestedCollectorsCanRunWhileTheOuterTeamIsBusy) {
     using Value = Range::value_type;
     std::mutex mutex;

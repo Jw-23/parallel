@@ -211,7 +211,7 @@ auto call(const Function& function, Args&&... args) {
     return into_result(detail::invoke(function, std::forward<Args>(args)...));
 }
 
-// One evaluation owns a team and submits synchronous batches to it.
+// An executor runs synchronous batches and retains its team between them.
 class Executor {
 public:
     using ChunkTask = std::function<Result<void>(std::size_t, std::size_t)>;
@@ -690,6 +690,8 @@ Result<A> reduce(const S& input, const A& initial, const F& combine, Executor& e
 
 }  // namespace detail
 
+using Executor = detail::Executor;
+
 // Operations build reusable plans. Each collection evaluates the plan again.
 // A calling thread can retain one idle team between collections.
 // Borrowed sources must remain alive and structurally stable during evaluation.
@@ -934,8 +936,14 @@ public:
     }
 
     Result<std::vector<value_type>> collect() const noexcept {
+        Executor executor(workers_, Executor::Reuse::calling_thread);
+        return collect(executor);
+    }
+
+    // Borrows the executor for this call. Its worker limit controls execution.
+    // Use one collection at a time per executor, including nested collections.
+    Result<std::vector<value_type>> collect(Executor& executor) const noexcept {
         return detail::run_safe([&]() -> Result<std::vector<value_type>> {
-            detail::Executor executor(workers_, detail::Executor::Reuse::calling_thread);
             auto values_result = (*evaluate_)(executor);
             if (!values_result) {
                 return values_result.as_failure();
