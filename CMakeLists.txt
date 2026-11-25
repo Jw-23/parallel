@@ -45,9 +45,13 @@ if(PARALLEL_BUILD_BENCHMARKS)
     URL https://codeload.github.com/google/benchmark/tar.gz/refs/tags/v1.9.0
     URL_HASH SHA256=35a77f46cc782b16fac8d3b107fbfbb37dcd645f7c28eee19f3b8e0758b48994)
   FetchContent_MakeAvailable(benchmark)
-  add_executable(parallel_benchmarks benchmarks/scheduler_benchmark.cpp)
+  add_executable(parallel_benchmarks
+    benchmarks/scheduler_benchmark.cpp
+    benchmarks/map_reduce_benchmark.cpp)
   target_link_libraries(parallel_benchmarks PRIVATE parallel benchmark::benchmark_main)
-  list(APPEND parallel_tidy_sources "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/scheduler_benchmark.cpp")
+  list(APPEND parallel_tidy_sources
+    "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/scheduler_benchmark.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/map_reduce_benchmark.cpp")
 endif()
 
 find_program(CLANG_TIDY_EXECUTABLE NAMES clang-tidy
