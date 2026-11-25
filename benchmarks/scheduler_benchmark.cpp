@@ -101,6 +101,7 @@ enum class Scheduler {
     fresh_dynamic_chunks,
     reused_dynamic_chunks,
     reused_static_chunks,
+    reused_work_stealing,
     fresh_mutex_pool,
     reused_mutex_pool,
 };
@@ -111,6 +112,7 @@ struct Workload {
     unsigned rounds;
     unsigned heavy_rounds;
     bool heavy_tail = false;
+    std::size_t grain_hint = 0;
 };
 
 std::uint64_t compute(std::size_t index, unsigned rounds) noexcept {
@@ -137,7 +139,8 @@ void compare_schedulers(benchmark::State& state, Scheduler scheduler, Workload w
     const auto size = static_cast<std::size_t>(state.range(0));
     const auto workers = static_cast<std::size_t>(state.range(1));
     // The mutex pool is a fixed-size chunking baseline.
-    const auto grain = std::max(std::size_t{1}, std::min(std::size_t{64}, size / workers / 8));
+    const auto grain = workload.grain_hint ? workload.grain_hint
+        : std::max(std::size_t{1}, std::min(std::size_t{64}, size / workers / 8));
     const auto heavy_begin = workload.heavy_tail ? size - std::min(std::size_t{64}, size) : 0;
     const auto heavy_end = workload.heavy_tail ? size : (workload.heavy_rounds == 0 ? 0 : size / 16);
     const auto calculate = [&](std::size_t index) {
@@ -156,12 +159,13 @@ void compare_schedulers(benchmark::State& state, Scheduler scheduler, Workload w
         return outcome::success();
     };
 
-    const auto schedule = scheduler == Scheduler::reused_static_chunks
-        ? parallel::Schedule::static_partition : parallel::Schedule::dynamic;
+    const auto schedule = scheduler == Scheduler::reused_static_chunks ? parallel::Schedule::static_partition
+        : scheduler == Scheduler::reused_work_stealing ? parallel::Schedule::work_stealing : parallel::Schedule::dynamic;
     Executor executor(workers, schedule);
     MutexPool locked(work);
-    if ((scheduler == Scheduler::reused_dynamic_chunks || scheduler == Scheduler::reused_static_chunks) &&
-        !succeeded(state, executor.run_chunks(size, work))) {
+    if ((scheduler == Scheduler::reused_dynamic_chunks || scheduler == Scheduler::reused_static_chunks ||
+         scheduler == Scheduler::reused_work_stealing) &&
+        !succeeded(state, executor.run_chunks(size, work, workload.grain_hint))) {
         return;
     }
     if (scheduler == Scheduler::reused_mutex_pool && !succeeded(state, locked.start(workers - 1))) {
@@ -181,14 +185,15 @@ void compare_schedulers(benchmark::State& state, Scheduler scheduler, Workload w
         }
         case Scheduler::fresh_dynamic_chunks: {
             Executor fresh(workers);
-            if (!succeeded(state, fresh.run_chunks(size, work))) {
+            if (!succeeded(state, fresh.run_chunks(size, work, workload.grain_hint))) {
                 return;
             }
             break;
         }
         case Scheduler::reused_dynamic_chunks:
         case Scheduler::reused_static_chunks:
-            if (!succeeded(state, executor.run_chunks(size, work))) {
+        case Scheduler::reused_work_stealing:
+            if (!succeeded(state, executor.run_chunks(size, work, workload.grain_hint))) {
                 return;
             }
             break;
@@ -316,6 +321,7 @@ const bool cases_registered = [] {
         {"FreshDynamicChunks", Scheduler::fresh_dynamic_chunks},
         {"ReusedDynamicChunks", Scheduler::reused_dynamic_chunks},
         {"ReusedStaticChunks", Scheduler::reused_static_chunks},
+        {"ReusedWorkStealing", Scheduler::reused_work_stealing},
         {"FreshMutexPool", Scheduler::fresh_mutex_pool},
         {"ReusedMutexPool", Scheduler::reused_mutex_pool},
     };
@@ -324,11 +330,15 @@ const bool cases_registered = [] {
         {"Uneven", {4096, 65536}, 8, 256},
         {"ShortTasks", {128, 4096}, 4, 0},
         {"LightUniform", {65536, 1048576}, 4, 0},
+        {"FineChunks", {65536, 1048576}, 4, 0, false, 16},
         {"LongTasks", {8, 32}, 1u << 20, 0},
         {"TailHeavy", {4096, 65536}, 4, 1u << 14, true},
     };
     for (const auto& scheduler : schedulers) {
         for (const auto& workload : workloads) {
+            if (workload.grain_hint != 0 && scheduler.type == Scheduler::pipeline_collect) {
+                continue;
+            }
             const auto name = std::string("compare_schedulers/") + scheduler.name + '/' + workload.name;
             auto* test = benchmark::RegisterBenchmark(name.c_str(), compare_schedulers, scheduler.type, workload);
             test->ArgNames({"tasks", "workers"})->UseRealTime()->Unit(benchmark::kMicrosecond);

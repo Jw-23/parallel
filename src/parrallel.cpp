@@ -47,32 +47,63 @@ std::size_t default_grain(std::size_t size, std::size_t workers) noexcept {
 }  // namespace
 
 struct Executor::Batch {
+    struct Queue {
+        std::atomic<std::size_t> next{0};
+        std::size_t first = 0;
+        std::size_t count = 0;
+        // Keep queue counters on separate cache lines even on C++14 heaps.
+        unsigned char padding[128 - sizeof(next) - sizeof(first) - sizeof(count)];
+    };
+
     Batch(std::size_t size, std::size_t workers, ChunkCallback run, std::size_t grain_hint, Schedule schedule)
         : size_(size),
           workers_(workers),
-          static_(schedule == Schedule::static_partition),
-          grain_(grain_hint ? std::min(grain_hint, size) : (static_ ? size : default_grain(size, workers))),
+          grain_(grain_hint ? std::min(grain_hint, size)
+                            : (schedule == Schedule::static_partition ? size : default_grain(size, workers))),
           tail_base_(grain_hint ? grain_ : std::min(std::size_t{64}, grain_)),
           tail_begin_(tail_base_ >= 16 ? size - tail_base_ - size % tail_base_ : size),
           tail_grain_(std::max(std::size_t{1}, tail_base_ / (grain_hint ? 4 : std::max(std::size_t{4}, workers)))),
           prefix_chunks_(divide_up(tail_begin_, grain_)),
           chunks_(prefix_chunks_ + divide_up(size - tail_begin_, tail_grain_)),
-          run_(run) {}
+          run_(run),
+          static_(schedule == Schedule::static_partition),
+          stealing_(schedule == Schedule::work_stealing && workers >= 4 &&
+                    size / workers >= 4096 && prefix_chunks_ / workers >= 4) {}
 
     bool is_static() const noexcept { return static_; }
+    bool uses_stealing() const noexcept { return stealing_; }
+
+    void set_queues(Queue* queues) noexcept {
+        queues_ = queues;
+        // Dense queues benefit from contiguous memory access. For coarser
+        // work, round-robin placement spreads neighboring expensive chunks.
+        const bool contiguous = prefix_chunks_ / workers_ >= 32;
+        const bool share_tail = contiguous || chunks_ - prefix_chunks_ >= 8;
+        const auto local_chunks = share_tail ? prefix_chunks_ : chunks_;
+        queue_stride_ = contiguous ? 1 : workers_;
+        const auto per_worker = local_chunks / workers_;
+        const auto extra = local_chunks % workers_;
+        for (std::size_t i = 0; i < workers_; ++i) {
+            queues[i].next.store(0, std::memory_order_relaxed);
+            queues[i].first = contiguous ? i * per_worker + std::min(i, extra) : i;
+            queues[i].count = per_worker + (i < extra);
+        }
+        // A shared tail only becomes eligible once the prefix has been claimed.
+        cursor_.next.store(local_chunks, std::memory_order_relaxed);
+    }
 
     bool defer_peer_wakeups() const noexcept { return !static_ && size_ < 8192 && grain_ > 1; }
 
     std::size_t claimed() const noexcept { return cursor_.next.load(std::memory_order_relaxed); }
 
     bool has_work() const noexcept {
-        return !cancelled_.load(std::memory_order_relaxed) && claimed() < chunks_;
+        return !cancelled_.load(std::memory_order_relaxed) && (stealing_ || claimed() < chunks_);
     }
 
     void work(std::size_t worker) noexcept {
         const auto status = run_safe([&]() -> Result<void> {
             ErrorCode error;
-            if (static_ ? run_static(worker, error) : run_dynamic(error)) {
+            if (run_work(worker, error)) {
                 return outcome::success();
             }
             return outcome::failure(error);
@@ -91,6 +122,49 @@ struct Executor::Batch {
     }
 
 private:
+    bool run_work(std::size_t worker, ErrorCode& error) {
+        if (static_) {
+            return run_static(worker, error);
+        }
+        if (stealing_) {
+            return run_stealing(worker, error);
+        }
+        return run_dynamic(error);
+    }
+
+    bool drain_queue(std::size_t victim, ErrorCode& error) {
+        auto& queue = queues_[victim];
+        while (!cancelled_.load(std::memory_order_relaxed)) {
+            const auto next = queue.next.fetch_add(1, std::memory_order_relaxed);
+            if (next >= queue.count || cancelled_.load(std::memory_order_relaxed)) {
+                break;
+            }
+            if (!run_dynamic_chunk(queue.first + next * queue_stride_, error)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool run_stealing(std::size_t worker, ErrorCode& error) {
+        if (!drain_queue(worker, error)) {
+            return false;
+        }
+        // Queues are populated before publication and only shrink. A single
+        // pass after the local queue is enough to find every unclaimed chunk.
+        auto victim = worker;
+        for (std::size_t visited = 1; visited < workers_; ++visited) {
+            if (++victim == workers_) {
+                victim = 0;
+            }
+            auto& queue = queues_[victim];
+            if (queue.next.load(std::memory_order_relaxed) < queue.count && !drain_queue(victim, error)) {
+                return false;
+            }
+        }
+        return claimed() >= chunks_ || run_dynamic(error);
+    }
+
     bool run_static(std::size_t worker, ErrorCode& error) const {
         const auto width = size_ / workers_;
         const auto extra = size_ % workers_;
@@ -141,7 +215,6 @@ private:
 
     const std::size_t size_;
     const std::size_t workers_;
-    const bool static_;
     const std::size_t grain_;
     const std::size_t tail_base_;
     const std::size_t tail_begin_;
@@ -149,8 +222,12 @@ private:
     const std::size_t prefix_chunks_;
     const std::size_t chunks_;
     const ChunkCallback run_;
-    std::atomic<bool> cancelled_{false};
+    Queue* queues_ = nullptr;
+    std::size_t queue_stride_ = 0;
     ErrorCode error_;
+    const bool static_;
+    const bool stealing_;
+    std::atomic<bool> cancelled_{false};
     // Keep the frequently updated ticket away from read-mostly batch state.
     struct alignas(128) ChunkCursor {
         std::atomic<std::size_t> next{0};
@@ -176,6 +253,14 @@ struct Executor::Team {
     Result<void> run(Batch& task, std::size_t background_workers) {
         // Grow the pool before publishing work. A failed launch runs no chunk of this batch.
         grow(background_workers);
+        if (task.uses_stealing()) {
+            const auto count = background_workers + 1;
+            if (queue_capacity < count) {
+                queues = std::make_unique<Batch::Queue[]>(count);
+                queue_capacity = count;
+            }
+            task.set_queues(queues.get());
+        }
         const auto initial = task.defer_peer_wakeups() ? std::size_t{1} : background_workers;
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -273,6 +358,8 @@ private:
     std::mutex mutex;
     std::condition_variable finished;
     std::vector<std::unique_ptr<Worker>> workers;
+    std::unique_ptr<Batch::Queue[]> queues;
+    std::size_t queue_capacity = 0;
     std::size_t worker_budget = 0;
     std::size_t published = 0;
     std::size_t last_claim = 0;

@@ -779,3 +779,64 @@ TEST(ChunkTest, StaticScheduleUsesBalancedContiguousPartitions) {
     const auto plan = Range(size).into_inter().reduce(Range::value_type{0}, std::plus<>{});
     expect_value(plan.collect_one(executor), 136);
 }
+
+TEST(SchedulerTest, WorkStealingDrainsTheQueueOfABlockedWorker) {
+    constexpr std::size_t size = 65539;
+    constexpr std::size_t grain = 512;
+    parallel::Executor executor(4, parallel::Schedule::work_stealing);
+    std::mutex mutex;
+    std::condition_variable progress;
+    std::vector<std::pair<std::size_t, std::size_t>> chunks;
+    std::size_t completed = 0;
+    bool blocked_worker_started = false;
+    const auto result = executor.run_borrowed_chunks(size, [&](std::size_t first, std::size_t last) {
+        std::unique_lock<std::mutex> lock(mutex);
+        chunks.emplace_back(first, last);
+        if (first == 0) {
+            blocked_worker_started = true;
+            progress.notify_all();
+            // This includes all remaining chunks originally assigned to this worker.
+            EXPECT_TRUE(progress.wait_for(lock, std::chrono::seconds(5), [&] { return completed == size - last; }));
+        } else {
+            EXPECT_TRUE(progress.wait_for(lock, std::chrono::seconds(5), [&] { return blocked_worker_started; }));
+            completed += last - first;
+            progress.notify_one();
+        }
+    }, grain);
+    ASSERT_TRUE(result) << result.error().message();
+    std::sort(chunks.begin(), chunks.end());
+    std::size_t next = 0;
+    for (const auto& chunk : chunks) {
+        EXPECT_EQ(chunk.first, next);
+        EXPECT_LE(chunk.second - chunk.first, grain);
+        next = chunk.second;
+    }
+    EXPECT_EQ(next, size);
+}
+
+TEST(SchedulerTest, WorkStealingRecoversFromFailureAndCanRunSmallerBatches) {
+    constexpr std::size_t size = 65536;
+    parallel::Executor executor(4, parallel::Schedule::work_stealing);
+    const auto error = std::make_error_code(std::errc::operation_canceled);
+    const auto stopped = executor.run_borrowed_chunks(size, [&](std::size_t first, std::size_t) -> Result<void> {
+        if (first == 0) {
+            return outcome::failure(error);
+        }
+        return outcome::success();
+    });
+    expect_error(stopped, error);
+
+    for (const auto count : {std::size_t{19}, size}) {
+        const auto end = static_cast<Range::value_type>(count);
+        const auto values = Range(end).iter_paral(4).map([](Range::value_type value) { return value + 1; })
+            .collect(executor);
+        const Range expected(1, end + 1);
+        expect_value(values, std::vector<Range::value_type>(expected.begin(), expected.end()));
+        std::atomic<std::size_t> processed{0};
+        const auto ran = executor.run_borrowed_chunks(count, [&](std::size_t first, std::size_t last) {
+            processed.fetch_add(last - first, std::memory_order_relaxed);
+        }, 16);
+        EXPECT_TRUE(ran) << ran.error().message();
+        EXPECT_EQ(processed.load(), count);
+    }
+}

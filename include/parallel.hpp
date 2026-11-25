@@ -37,7 +37,8 @@ enum class Errc { unexpected_exception = 1 };
 ErrorCode make_error_code(Errc error) noexcept;
 
 // Dynamic workers share chunks. Static workers each own a balanced contiguous partition.
-enum class Schedule { dynamic, static_partition };
+// Work stealing uses local queues on sufficiently large batches and the dynamic queue otherwise.
+enum class Schedule { dynamic, static_partition, work_stealing };
 
 struct EvaluationOptions {
     // Borrowed for the call. Library scratch allocations run on the calling thread.
